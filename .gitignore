@@ -1,207 +1,318 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import requests
+import sys
+import datetime
+import smtplib
+from email.message import EmailMessage
+from requests.auth import HTTPBasicAuth
+from pymisp import PyMISP, MISPEvent, MISPAttribute
+# Nota: La importacion de urllib3 para deshabilitar warnings fue eliminada
+# ya que no es necesaria para la logica principal y se recomienda no usar.
 
-# C extensions
-*.so
+# --- 1. CONFIGURACION DE ACCESO (¡REEMPLAZAR CON VALORES REALES!) ---
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# 1a. API Externa (ANCI / CSIRT Nacional)
+# La URL base de la API
+ANCI_API_URL = "https://apimisp.csirt.gob.cl"
+# Credenciales de usuario para la API de ANCI/CSIRT
+ANCI_USER = "TU_USUARIO_ANCI"
+ANCI_PASS = "TU_PASSWORD_ANCI"
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# 1b. Tu MISP Local (Siptel o similar)
+# URL de tu instancia MISP
+MISP_LOCAL_URL = "https://TU_IP_O_DOMINIO_MISP"
+# Clave API de tu MISP
+MISP_LOCAL_KEY = "TU_MISP_API_KEY"
+# Si tu MISP usa un certificado autofirmado (se mantiene en False por defecto para entornos internos)
+MISP_VERIFY_CERT = False
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# --- 1c. CONFIGURACION DE EMAIL (¡REEMPLAZAR CON VALORES REALES!) ---
+# Poner en False para desactivar el envio de correos
+EMAIL_ENABLED = True
+EMAIL_HOST = "mail.TU_DOMINIO.cl"
+EMAIL_PORT = 465
+EMAIL_USER = "tu_usuario_correo"
+# Se usa r"..." (raw string) por si la contrasena contiene backslash
+EMAIL_PASSWORD = "TU_PASSWORD_CORREO"
+EMAIL_SENDER = "remitente@tu_dominio.cl"
+EMAIL_RECIPIENTS = ["soc@tu_dominio.cl", "otro_contacto@tu_dominio.cl"]
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
 
-# Translations
-*.mo
-*.pot
+def get_anci_token():
+    """
+    Se autentica contra el endpoint /token para obtener un Bearer Token JWT.
+    """
+    print("Obteniendo token de autenticacion desde ANCI...")
+    token_url = f"{ANCI_API_URL}/token"
+    auth_payload = {
+        "username": ANCI_USER,
+        "password": ANCI_PASS
+    }
+    try:
+        response = requests.post(token_url, json=auth_payload, timeout=10)
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+        if response.status_code == 200:
+            token = response.json().get('access_token')
+            print("Token Bearer obtenido exitosamente!")
+            return token
+        else:
+            print(f"[ERROR] Fallo al obtener token: {response.status_code} - {response.text}")
+            return None
 
-# Flask stuff:
-instance/
-.webassets-cache
+    except Exception as e:
+        print(f"[ERROR] No se pudo conectar a {token_url}: {e}")
+        return None
 
-# Scrapy stuff:
-.scrapy
+def process_iocs(misp_event, headers, payload, endpoint, response_key, tipo_mapeo):
+    """
+    Funcion generica para procesar endpoints de IoC simples (dominios, urls).
+    """
+    ioc_count = 0
+    url = f"{ANCI_API_URL}{endpoint}"
+    print(f"\nObteniendo indicadores de: {endpoint}...")
 
-# Sphinx documentation
-docs/_build/
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
 
-# PyBuilder
-.pybuilder/
-target/
+        if response.status_code == 200:
+            data = response.json().get('response', {})
+            iocs = data.get(response_key, [])
 
-# Jupyter Notebook
-.ipynb_checkpoints
+            if not iocs:
+                print(f"No se encontraron nuevos indicadores en '{endpoint}'.")
+                return 0
 
-# IPython
-profile_default/
-ipython_config.py
+            print(f"Exito! Se obtuvieron {len(iocs)} indicadores de '{response_key}'.")
+            for item in iocs:
+                valor = item.get('valor')
+                tipo_misp = tipo_mapeo.get(item.get('tipo'), item.get('tipo'))
+                if valor and tipo_misp:
+                    attr = MISPAttribute()
+                    attr.type = tipo_misp
+                    attr.value = valor
+                    attr.comment = "Importado desde ANCI API"
+                    attr.to_ids = True
+                    misp_event.add_attribute(**attr)
+                    ioc_count += 1
+        elif response.status_code == 404:
+            print(f"No se encontraron resultados para el rango de fechas en '{endpoint}'.")
+        else:
+            print(f"[ADVERTENCIA] API devolvio error para '{endpoint}': {response.status_code} - {response.text}")
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    except Exception as e:
+        print(f"[ADVERTENCIA] No se pudo conectar a '{endpoint}': {e}")
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+    return ioc_count
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+def process_nested_iocs(misp_event, headers, payload, endpoint, response_key):
+    """
+    Funcion para procesar endpoints anidados (ip_amenazas, hashes).
+    """
+    ioc_count = 0
+    url = f"{ANCI_API_URL}{endpoint}"
+    print(f"\nObteniendo indicadores de: {endpoint}...")
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+        if response.status_code == 200:
+            data = response.json().get('response', {})
+            amenazas_dict = data.get(response_key, {})
+            if not amenazas_dict:
+                print(f"No se encontraron nuevos indicadores en '{endpoint}'.")
+                return 0
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+            print(f"Exito! Procesando {len(amenazas_dict)} grupos de amenazas...")
+            for malware_name, ioc_list in amenazas_dict.items():
+                for item in ioc_list:
+                    valor = item.get('valor')
+                    tipo_misp = item.get('tipo')
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+                    if valor and tipo_misp:
+                        attr = MISPAttribute()
+                        attr.type = tipo_misp
+                        attr.value = valor
+                        attr.comment = f"Amenaza: {malware_name} (Importado desde ANCI API)"
+                        attr.to_ids = True
+                        misp_event.add_attribute(**attr)
+                        ioc_count += 1
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+        elif response.status_code == 404:
+            print(f"No se encontraron resultados para el rango de fechas en '{endpoint}'.")
+        else:
+            print(f"[ADVERTENCIA] API devolvio error para '{endpoint}': {response.status_code} - {response.text}")
 
-# SageMath parsed files
-*.sage.py
+    except Exception as e:
+        print(f"[ADVERTENCIA] No se pudo conectar a '{endpoint}': {e}")
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+    return ioc_count
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# --- FUNCION DE EMAIL ---
+def send_notification_email(event_url, event_id, ioc_count):
+    """
+    Envia un correo electronico de notificacion.
+    """
+    if not EMAIL_ENABLED:
+        print("El envio de correo esta desactivado. Omitiendo.")
+        return
 
-# Rope project settings
-.ropeproject
+    print("Enviando correo de notificacion...")
 
-# mkdocs documentation
-/site
+    # 1. Crear el mensaje
+    msg = EmailMessage()
+    msg['Subject'] = f"MISP: Nuevo Evento Creado (ID: {event_id}) - {ioc_count} IoCs de ANCI"
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = ", ".join(EMAIL_RECIPIENTS)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+    body = f"""
+    Hola equipo SOC,
 
-# Pyre type checker
-.pyre/
+    El conector de ANCI se ha ejecutado exitosamente.
 
-# pytype static type analyzer
-.pytype/
+    Se creo un nuevo evento en MISP con los ultimos indicadores de compromiso.
 
-# Cython debug symbols
-cython_debug/
+    - Evento: {event_url}
+    - Indicadores anadidos: {ioc_count}
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+    Saludos,
+    Conector (synsoc)
+    SIPTEL (o nombre de tu organizacion)
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+    """
+    msg.set_content(body)
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+    # 2. Enviar el mensaje
+    try:
+        if EMAIL_PORT == 465:
+            # Usar si el puerto es 465 (SSL)
+            print(f"Conectando a {EMAIL_HOST}:{EMAIL_PORT} via SSL...")
+            server = smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT)
+        else:
+            # Usar si el puerto es 587 (STARTTLS) o 25 (sin cifrado)
+            print(f"Conectando a {EMAIL_HOST}:{EMAIL_PORT}...")
+            server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+            if EMAIL_PORT == 587:
+                server.starttls()
 
-# Ruff stuff:
-.ruff_cache/
+        print("Iniciando sesion SMTP...")
+        server.login(EMAIL_USER, EMAIL_PASSWORD)
+        print("Sesion SMTP exitosa. Enviando mensaje...")
+        server.send_message(msg)
+        server.quit()
+        print("¡Correo de notificacion enviado!")
 
-# PyPI configuration file
-.pypirc
+    except Exception as e:
+        print(f"[ADVERTENCIA] No se pudo enviar el correo de notificacion: {e}")
+# --- FIN DE LA FUNCION DE EMAIL ---
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+def main():
+    print(f"--- [v3.4 - Con Email] Iniciando conector ANCI-MISP ---")
+
+    # 1. Obtener Token Bearer
+    token = get_anci_token()
+    if not token:
+        sys.exit(1)
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 2. Definir Payload de Fechas (Ultimos 30 dias)
+    now = datetime.datetime.now()
+    past = now - datetime.timedelta(days=30)
+    date_payload = {
+        "fecha_desde": past.strftime('%Y-%m-%d %H:%M:%S'),
+        "fecha_hasta": now.strftime('%Y-%m-%d %H:%M:%S')
+    }
+    print(f"Buscando indicadores desde {date_payload['fecha_desde']} hasta {date_payload['fecha_hasta']}")
+
+    # 3. Conectar a MISP Local
+    print(f"Conectando a MISP local en {MISP_LOCAL_URL}...")
+    try:
+        misp = PyMISP(MISP_LOCAL_URL, MISP_LOCAL_KEY, MISP_VERIFY_CERT)
+        print("Conexion exitosa a MISP local!")
+    except Exception as e:
+        print(f"[ERROR] No se pudo conectar a MISP local: {e}")
+        sys.exit(1)
+
+    # 4. Preparar Evento en MISP
+    fecha_hoy = now.strftime('%Y-%m-%d')
+    event = MISPEvent()
+    event.info = f"Indicadores Agregados - CSIRT Nacional (ANCI) - {fecha_hoy}"
+    event.add_tag("CSIRT-Nacional-Chile")
+    event.add_tag("Fuente:API-ANCI")
+
+    total_added_iocs = 0
+    print(f"Preparando evento: '{event.info}'")
+
+    # 5. Procesar cada endpoint y anadir tags especificos
+    print("Procesando indicadores por tipo...")
+
+    # IPs (Anidado)
+    ip_count = process_nested_iocs(event, headers, date_payload,
+                                   endpoint="/ioc/ip_amenazas",
+                                   response_key="amenazas")
+    if ip_count > 0:
+        event.add_tag("IOC-IPV4")
+    total_added_iocs += ip_count
+
+    # Hashes (Anidado)
+    hash_count = process_nested_iocs(event, headers, date_payload,
+                                     endpoint="/ioc/hashes",
+                                     response_key="amenazas")
+    if hash_count > 0:
+        event.add_tag("IOC-HASH")
+    total_added_iocs += hash_count
+
+    # Dominios (Simple)
+    domain_count = process_iocs(event, headers, date_payload,
+                                 endpoint="/ioc/dominios",
+                                 response_key="dominios",
+                                 tipo_mapeo={'hostname': 'hostname'})
+    if domain_count > 0:
+        event.add_tag("IOC-DOMINIOS")
+    total_added_iocs += domain_count
+
+    # URLs (Simple)
+    url_count = process_iocs(event, headers, date_payload,
+                             endpoint="/ioc/urls",
+                             response_key="urls",
+                             tipo_mapeo={'link': 'url'})
+    if url_count > 0:
+        event.add_tag("IOC-URL")
+    total_added_iocs += url_count
+
+    print("Procesamiento de indicadores completado.")
+
+
+    # 6. Guardar el Evento en MISP
+    if total_added_iocs > 0:
+        print("\n-------------------------------------------------")
+        print(f"Anadiendo {total_added_iocs} indicadores totales al evento...")
+        try:
+            # Se elimina 'requests.packages.urllib3.disable_warnings()'
+
+            evento_creado = misp.add_event(event)
+
+            if isinstance(evento_creado, dict) and 'Event' in evento_creado and 'id' in evento_creado['Event']:
+                event_id = evento_creado['Event']['id']
+                event_url = f"{MISP_LOCAL_URL}/events/view/{event_id}"
+
+                print("EXITO!!")
+                print(f"Evento creado/actualizado en tu MISP: {event_url}")
+                print("-------------------------------------------------")
+
+                # Llamar a la funcion de email!
+                send_notification_email(event_url, event_id, total_added_iocs)
+            else:
+                print("[ERROR] El evento se envio, pero MISP devolvio una respuesta inesperada.")
+                print(f"Respuesta recibida: {evento_creado}")
+
+        except Exception as e:
+            print(f"[ERROR] No se pudo crear el evento en MISP: {e}")
+    else:
+        print("\n-------------------------------------------------")
+        print("No se obtuvieron nuevos indicadores. No se creara ningun evento.")
+        print("-------------------------------------------------")
+
+# --- EJECUTAR SCRIPT ---
+if __name__ == "__main__":
+    main()
