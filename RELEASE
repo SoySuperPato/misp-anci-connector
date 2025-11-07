@@ -1,3 +1,0 @@
-Tag version: v1.0.0
-Release title: Initial Stable Release o Conector funcional ANCI v1.0
-Description: "Versión inicial del conector para la API del CSIRT Nacional de Chile, permitiendo la importación de IoCs (IPs, Hashes, Dominios, URLs) de los últimos 30 días a MISP."
