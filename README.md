@@ -68,15 +68,15 @@ Configura las siguientes variables en el shell que ejecuta el script (`~/.bashrc
 
 | Variable | Descripción | Ejemplo de Valor |
 | :--- | :--- | :--- |
-| `ANCI_USER` | Usuario de la API de ANCI/CSIRT Nacional. | `usuario@ejemplo.cl` |
-| `ANCI_PASS` | Contraseña del usuario ANCI. | `A1b2C3d4E5f6G7h8` |
-| `MISP_LOCAL_URL` | URL de tu instancia MISP (sin barra al final). | `https://10.164.18.12` |
-| `MISP_LOCAL_KEY` | Clave API de tu usuario MISP. | `aNrUiLVodUmOltrIF...` |
+| `ANCI_USER` | Usuario de la API de ANCI/CSIRT Nacional.|
+| `ANCI_PASS` | Contraseña del usuario ANCI. |
+| `MISP_LOCAL_URL` | URL de tu instancia MISP (sin barra al final). |
+| `MISP_LOCAL_KEY` | Clave API de tu usuario MISP. |
 
 **Ejemplo de cómo exportar las variables temporalmente:**
 
 ```bash
-export MISP_LOCAL_URL="https://10.164.18.12"
+export MISP_LOCAL_URL="https://172.20.10.02"
 export MISP_LOCAL_KEY="TU_CLAVE_AQUI"
 # ... y las credenciales de ANCI
 ```
