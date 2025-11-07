@@ -48,8 +48,8 @@ pip install requests pymisp
 
 1.  Clona el repositorio:
     ```bash
-    git clone https://github.com/tu-usuario/tu-repositorio.git
-    cd tu-repositorio
+    git clone https://github.com/SoySuperPato/misp-anci-connector.git
+    cd misp-anci-connector
     ```
 2.  Crea y activa el entorno virtual (opcional pero recomendado):
     ```bash
